@@ -70,7 +70,7 @@ label {
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<div class='banner'>📘 Smart Attendance System</div>", unsafe_allow_html=True)
+st.markdown("<div class='banner'> Smart Attendance System</div>", unsafe_allow_html=True)
 
 # ==================================================
 # DATABASE
