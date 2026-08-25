@@ -4,6 +4,9 @@ import sqlite3
 import uuid
 import time
 import pandas as pd
+import cv2
+import numpy as np
+from PIL import Image
 from contextlib import closing
 from io import BytesIO
 import qrcode
@@ -11,7 +14,10 @@ import qrcode
 # ==================================================
 # CONFIG
 # ==================================================
-DB = "attendance_pro.db"
+DATA_DIR = "data"
+DB = os.path.join(DATA_DIR, "attendance_pro.db")
+ENROLLMENT_FILE = os.path.join(DATA_DIR, "enrollment.xlsx")
+CLASS_FILE = os.path.join(DATA_DIR, "class_details.xlsx")
 QR_REFRESH_SECONDS = 10
 SESSION_VALIDITY = 300
 ADMIN_PASSWORD = "a"   # change later
@@ -80,8 +86,6 @@ DEFAULT_PROGRAMS = ["MSc CS", "MSc DFIS", "MTech Cyber"]
 DEFAULT_SUBJECTS = ["AI", "Blockchain", "Cyber Security", "Digital Forensics"]
 DEFAULT_SEMESTERS = ["Sem 1", "Sem 2", "Sem 3", "Sem 4"]
 DEFAULT_TIME_SLOTS = ["09:00–10:00", "10:00–11:00", "11:15–12:15"]
-ENROLLMENT_FILE = "enrollment.xlsx"
-CLASS_FILE = "class_details.xlsx"
 
 
 def conn():
@@ -139,6 +143,7 @@ def init_db():
         """)
         c.commit()
 
+os.makedirs(DATA_DIR, exist_ok=True)
 init_db()
 
 if os.path.exists(ENROLLMENT_FILE) and not st.session_state.get("enrollment_loaded"):
@@ -164,6 +169,25 @@ def generate_qr(data):
     qr.add_data(data)
     qr.make(fit=True)
     return qr.make_image(fill_color="black", back_color="white")
+
+
+def decode_qr_image(uploaded_image):
+    try:
+        image = Image.open(uploaded_image).convert("RGB")
+        img_array = np.array(image)
+        detector = cv2.QRCodeDetector()
+        data, points, _ = detector.detectAndDecode(img_array)
+        if data:
+            return data.strip()
+
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        scaled = cv2.pyrUp(gray)
+        data, points, _ = detector.detectAndDecode(scaled)
+        if data:
+            return data.strip()
+    except Exception:
+        pass
+    return ""
 
 
 def get_device_id():
@@ -263,10 +287,11 @@ def save_roster_file(xls):
 
 
 def load_local_enrollments():
-    if not os.path.exists(ENROLLMENT_FILE):
-        return 0, []
-    workbook = pd.read_excel(ENROLLMENT_FILE, sheet_name=None)
-    return save_roster_file(workbook)
+    for path in (ENROLLMENT_FILE, "enrollment.xlsx"):
+        if os.path.exists(path):
+            workbook = pd.read_excel(path, sheet_name=None)
+            return save_roster_file(workbook)
+    return 0, []
 
 
 def load_class_options():
@@ -408,6 +433,26 @@ if st.session_state.role == "faculty":
 
             st.image(buf, width=300)
             st.info(f"Share this QR code or session code with students. Session expires in {remaining}s.")
+
+            with closing(conn()) as c:
+                attendance_rows = c.execute("""
+                    SELECT s.name, s.enrollment, s.program, s.semester,
+                           datetime(a.timestamp,'unixepoch') as time,
+                           a.device_id, a.device_info
+                    FROM attendance a
+                    JOIN students s ON a.student_id=s.id
+                    JOIN sessions se ON a.session_id=se.id
+                    WHERE se.session_code=?
+                    ORDER BY a.timestamp
+                """, (st.session_state.session_code,)).fetchall()
+
+            if attendance_rows:
+                st.markdown("### 📌 Students Marked Present")
+                attendance_df = pd.DataFrame(attendance_rows)
+                st.dataframe(attendance_df, use_container_width=True)
+            else:
+                st.info("No students have marked attendance yet.")
+
             if st.button("End Session", key="end_session"):
                 st.warning("Attendance session ended by faculty.")
                 del st.session_state.session_code
@@ -463,8 +508,19 @@ if st.session_state.role == "student":
 
     st.markdown("---")
     st.markdown("### 📷 Scan QR Code (Optional)")
-    st.info("If QR scanning does not auto-fill, use the Session Code below.")
+    st.info("Point the camera at the QR code or upload a photo. The session code will auto-fill when detected.")
     camera_img = st.camera_input("Open Camera to scan QR", key="qr_camera")
+    qr_upload = st.file_uploader("Or upload QR image", type=["png", "jpg", "jpeg"], key="qr_upload")
+
+    if camera_img is not None or qr_upload is not None:
+        data = decode_qr_image(camera_img if camera_img is not None else qr_upload)
+        if data:
+            if data.startswith("?code="):
+                data = data.split("?code=", 1)[1]
+            st.session_state.s_code = data
+            st.success("QR code scanned successfully.")
+        else:
+            st.info("Scanning... make sure the QR code is clear and fully visible.")
 
     st.markdown("---")
     st.markdown("### 🔢 Session Code")

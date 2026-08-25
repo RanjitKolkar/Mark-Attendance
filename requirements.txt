@@ -3,3 +3,5 @@ pandas
 qrcode[pil]
 pillow
 openpyxl
+numpy
+opencv-python-headless
