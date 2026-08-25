@@ -1,4 +1,5 @@
 import streamlit as st
+import os
 import sqlite3
 import uuid
 import time
@@ -79,6 +80,8 @@ DEFAULT_PROGRAMS = ["MSc CS", "MSc DFIS", "MTech Cyber"]
 DEFAULT_SUBJECTS = ["AI", "Blockchain", "Cyber Security", "Digital Forensics"]
 DEFAULT_SEMESTERS = ["Sem 1", "Sem 2", "Sem 3", "Sem 4"]
 DEFAULT_TIME_SLOTS = ["09:00–10:00", "10:00–11:00", "11:15–12:15"]
+ENROLLMENT_FILE = "enrollment.xlsx"
+CLASS_FILE = "class_details.xlsx"
 
 
 def conn():
@@ -123,9 +126,27 @@ def init_db():
             device_info TEXT
         )
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS class_options(
+            id INTEGER PRIMARY KEY,
+            program TEXT,
+            semester TEXT,
+            subject TEXT,
+            time_slot TEXT,
+            source TEXT,
+            UNIQUE(program, semester, subject, time_slot)
+        )
+        """)
         c.commit()
 
 init_db()
+
+if os.path.exists(ENROLLMENT_FILE) and not st.session_state.get("enrollment_loaded"):
+    try:
+        load_local_enrollments()
+    except Exception:
+        pass
+    st.session_state.enrollment_loaded = True
 
 # ==================================================
 # HELPERS
@@ -168,20 +189,46 @@ def get_student_by_enrollment(enrollment):
         return c.execute("SELECT * FROM students WHERE enrollment=?", (enrollment,)).fetchone()
 
 
-def save_roster(df):
+def infer_sheet_defaults(sheet_name: str):
+    lower = sheet_name.lower()
+    program = ""
+    semester = ""
+
+    if "cyber" in lower:
+        program = "MSc Cybersecurity"
+    elif "forens" in lower or "inf sec" in lower or "digital" in lower:
+        program = "Digital Forensics and Inf Sec"
+
+    if "sem" in lower:
+        import re
+        m = re.search(r"sem(?:ester)?\s*([0-9]+)", lower)
+        if m:
+            semester = f"Sem {m.group(1)}"
+    return program, semester
+
+
+def save_roster_df(df, default_program="", default_semester=""):
     normalized = {col.strip().lower(): col for col in df.columns}
-    required = ["name", "enrollment", "program", "semester"]
+    required = ["name", "enrollment"]
     for key in required:
         if key not in normalized:
             raise ValueError(f"Roster file must include '{key}' column")
 
+    program_col = normalized.get("program")
+    semester_col = normalized.get("semester")
+    imported = 0
+
     with closing(conn()) as c:
         cur = c.cursor()
         for _, row in df.iterrows():
-            name = str(row[normalized["name"]]).strip()
-            enrollment = str(row[normalized["enrollment"]]).strip()
-            program = str(row[normalized["program"]]).strip()
-            semester = str(row[normalized["semester"]]).strip()
+            name = str(row.get(normalized["name"], "")).strip()
+            enrollment = str(row.get(normalized["enrollment"], "")).strip()
+            program = str(row.get(program_col, "")).strip() if program_col else ""
+            semester = str(row.get(semester_col, "")).strip() if semester_col else ""
+            if not program:
+                program = default_program
+            if not semester:
+                semester = default_semester
             if not name or not enrollment:
                 continue
             cur.execute("""
@@ -192,7 +239,91 @@ def save_roster(df):
                 program=excluded.program,
                 semester=excluded.semester
             """, (name, enrollment, program, semester, now()))
+            imported += 1
         c.commit()
+    return imported
+
+
+def save_roster_file(xls):
+    total = 0
+    summaries = []
+
+    if isinstance(xls, dict):
+        for sheet_name, df in xls.items():
+            program, semester = infer_sheet_defaults(sheet_name)
+            count = save_roster_df(df, program, semester)
+            summaries.append((sheet_name, count, program, semester))
+            total += count
+    else:
+        count = save_roster_df(xls)
+        summaries.append(("Sheet", count, "", ""))
+        total += count
+
+    return total, summaries
+
+
+def load_local_enrollments():
+    if not os.path.exists(ENROLLMENT_FILE):
+        return 0, []
+    workbook = pd.read_excel(ENROLLMENT_FILE, sheet_name=None)
+    return save_roster_file(workbook)
+
+
+def load_class_options():
+    with closing(conn()) as c:
+        return c.execute("SELECT DISTINCT program, semester, subject, time_slot FROM class_options ORDER BY program, semester, subject, time_slot").fetchall()
+
+
+def get_class_list(column):
+    seen = []
+    for row in load_class_options():
+        value = row[column]
+        if value and value not in seen:
+            seen.append(value)
+    return seen
+
+
+def save_class_options_df(df):
+    normalized = {col.strip().lower(): col for col in df.columns}
+    required = ["program", "semester", "subject", "time_slot"]
+    for key in required:
+        if key not in normalized:
+            raise ValueError(f"Class file must include '{key}' column")
+
+    imported = 0
+    with closing(conn()) as c:
+        cur = c.cursor()
+        for _, row in df.iterrows():
+            program = str(row.get(normalized["program"], "")).strip()
+            semester = str(row.get(normalized["semester"], "")).strip()
+            subject = str(row.get(normalized["subject"], "")).strip()
+            time_slot = str(row.get(normalized["time_slot"], "")).strip()
+            if not program or not semester or not subject or not time_slot:
+                continue
+            cur.execute("""
+            INSERT OR IGNORE INTO class_options(program,semester,subject,time_slot,source)
+            VALUES(?,?,?,?,?)
+            """, (program, semester, subject, time_slot, "admin_upload"))
+            imported += cur.rowcount
+        c.commit()
+    return imported
+
+
+def save_class_file(xls):
+    total = 0
+    summaries = []
+
+    if isinstance(xls, dict):
+        for sheet_name, df in xls.items():
+            count = save_class_options_df(df)
+            summaries.append((sheet_name, count))
+            total += count
+    else:
+        count = save_class_options_df(xls)
+        summaries.append(("Sheet", count))
+        total += count
+
+    return total, summaries
 
 # ==================================================
 # ROLE SELECTION
@@ -222,22 +353,22 @@ if st.session_state.role == "faculty":
     with st.container():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
 
-        program_choices = ["Add new program..."] + DEFAULT_PROGRAMS
+        program_choices = ["Add new program..."] + (get_class_list("program") or DEFAULT_PROGRAMS)
         program = st.selectbox("Program", program_choices)
         if program == "Add new program...":
             program = st.text_input("New Program", key="new_program")
 
-        semester_choices = ["Add new semester..."] + DEFAULT_SEMESTERS
+        semester_choices = ["Add new semester..."] + (get_class_list("semester") or DEFAULT_SEMESTERS)
         semester = st.selectbox("Semester", semester_choices)
         if semester == "Add new semester...":
             semester = st.text_input("New Semester", key="new_semester")
 
-        subject_choices = ["Add new subject..."] + DEFAULT_SUBJECTS
+        subject_choices = ["Add new subject..."] + (get_class_list("subject") or DEFAULT_SUBJECTS)
         subject = st.selectbox("Subject", subject_choices)
         if subject == "Add new subject...":
             subject = st.text_input("New Subject", key="new_subject")
 
-        time_slot_choices = ["Add new slot..."] + DEFAULT_TIME_SLOTS
+        time_slot_choices = ["Add new slot..."] + (get_class_list("time_slot") or DEFAULT_TIME_SLOTS)
         time_slot = st.selectbox("Time Slot", time_slot_choices)
         if time_slot == "Add new slot...":
             time_slot = st.text_input("Custom Time Slot", key="new_time_slot")
@@ -298,10 +429,13 @@ if st.session_state.role == "faculty":
 if st.session_state.role == "student":
     st.markdown("<div class='card'><h2 style='font-size:28px;'>🎓 Student Attendance</h2></div>", unsafe_allow_html=True)
 
-    params = st.experimental_get_query_params()
+    params = st.query_params
     code_from_qr = params.get("code", [""])[0]
     device_id = get_device_id()
     device_info = get_device_info()
+
+    if st.session_state.get("enrollment_loaded"):
+        st.info(f"Enrollments from {ENROLLMENT_FILE} are loaded automatically.")
 
     students = load_students()
     roster_options = ["New student registration"] + [f"{row['enrollment']} | {row['name']}" for row in students]
@@ -413,23 +547,51 @@ if st.session_state.role == "admin":
         st.stop()
 
     st.markdown("### 📥 Upload Student Roster")
-    st.info("Upload an Excel file with columns: name, enrollment, program, semester.")
+    st.info("Upload an Excel file with one or more sheets. Each sheet should include name and enrollment. Optional program and semester columns are also supported.")
     roster_file = st.file_uploader("Upload roster Excel", type=["xlsx", "xls"], key="roster_upload")
     if roster_file is not None:
         try:
-            roster_df = pd.read_excel(roster_file)
-            save_roster(roster_df)
-            st.success("Roster uploaded and saved successfully.")
+            workbook = pd.read_excel(roster_file, sheet_name=None)
+            total, summaries = save_roster_file(workbook)
+            st.success(f"Uploaded {total} student enrollments from {len(summaries)} sheet(s).")
+            for sheet_name, count, program, semester in summaries:
+                details = []
+                if program:
+                    details.append(f"program={program}")
+                if semester:
+                    details.append(f"semester={semester}")
+                extra = f" ({', '.join(details)})" if details else ""
+                st.write(f"- {sheet_name}: {count} rows{extra}")
         except Exception as e:
             st.error(f"Failed to upload roster: {e}")
 
+    st.markdown("### 📥 Upload Class Details")
+    st.info("Upload an Excel file with columns: program, semester, subject, time_slot. Multiple sheets are supported.")
+    class_file = st.file_uploader("Upload class details Excel", type=["xlsx", "xls"], key="class_upload")
+    if class_file is not None:
+        try:
+            workbook = pd.read_excel(class_file, sheet_name=None)
+            total, summaries = save_class_file(workbook)
+            st.success(f"Uploaded {total} class rows from {len(summaries)} sheet(s).")
+            for sheet_name, count in summaries:
+                st.write(f"- {sheet_name}: {count} rows")
+        except Exception as e:
+            st.error(f"Failed to upload class details: {e}")
+
     student_rows = load_students()
+    class_rows = load_class_options()
     if student_rows:
         st.markdown("### 📋 Uploaded Student Roster")
         student_df = pd.DataFrame(student_rows)
         student_df = student_df[["name", "enrollment", "program", "semester", "registered_at"]]
         student_df = student_df.rename(columns={"registered_at": "registered_at_unix"})
         st.dataframe(student_df, use_container_width=True)
+
+    if class_rows:
+        st.markdown("### 🧑‍🏫 Uploaded Class Options")
+        class_df = pd.DataFrame(class_rows)
+        class_df = class_df[["program", "semester", "subject", "time_slot"]]
+        st.dataframe(class_df, use_container_width=True)
 
     st.markdown("### 🧾 Attendance Records")
     with closing(conn()) as c:
